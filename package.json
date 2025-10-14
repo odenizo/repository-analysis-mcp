@@ -8,6 +8,11 @@
     "start": "node src/index.js",
     "process": "node src/process-repository.js",
     "analyze": "node src/analyze-repositories.js",
+    "demo": "bash demo.sh",
+    "list": "node src/index.js list",
+    "categories": "node src/index.js categories",
+    "tools": "node src/index.js tools",
+    "help": "node src/index.js help",
     "test": "echo \"No tests specified yet\" && exit 0"
   },
   "keywords": ["mcp", "repository-analysis", "repomix", "llm", "analysis"],

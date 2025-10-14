@@ -2,6 +2,9 @@ node_modules/
 *.log
 .env
 *.db
+*.db-journal
+*.db-shm
+*.db-wal
 dist/
 build/
 .DS_Store
@@ -9,3 +12,5 @@ coverage/
 temp/
 tmp/
 *.tmp
+repomix-outputs/
+reports/

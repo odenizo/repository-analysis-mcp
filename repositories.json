@@ -1,0 +1,12 @@
+[
+  {
+    "name": "mcp-servers-official",
+    "url": "https://github.com/modelcontextprotocol/servers",
+    "description": "Official Model Context Protocol servers implementation"
+  },
+  {
+    "name": "mcp-server-fetch",
+    "url": "https://github.com/modelcontextprotocol/mcp-server-fetch",
+    "description": "MCP server for fetching web content"
+  }
+]

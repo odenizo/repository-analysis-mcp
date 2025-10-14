@@ -1,0 +1,164 @@
+name: Generate Analysis Report
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run daily at 6:00 AM UTC
+    - cron: '0 6 * * *'
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Download latest database
+        uses: actions/download-artifact@v4
+        with:
+          name: repository-database
+          path: .
+        continue-on-error: true
+
+      - name: Generate comprehensive report
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          # Create reports directory
+          mkdir -p reports
+          
+          # Generate main report
+          {
+            echo "# Repository Analysis Report"
+            echo ""
+            echo "**Generated:** $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+            echo ""
+            
+            echo "## Overview"
+            echo ""
+            
+            # Get repository count
+            REPO_COUNT=$(node -e "
+              import { RepositoryDatabase } from './src/database/db.js';
+              const db = new RepositoryDatabase();
+              const repos = db.getAllRepositories();
+              console.log(repos.length);
+              db.close();
+            " 2>/dev/null || echo "0")
+            
+            echo "- **Total Repositories:** $REPO_COUNT"
+            
+            # Get tool count
+            TOOL_COUNT=$(node -e "
+              import { RepositoryDatabase } from './src/database/db.js';
+              const db = new RepositoryDatabase();
+              const tools = db.getAllTools();
+              console.log(tools.length);
+              db.close();
+            " 2>/dev/null || echo "0")
+            
+            echo "- **Total Tools:** $TOOL_COUNT"
+            
+            # Get category count
+            CAT_COUNT=$(node -e "
+              import { RepositoryDatabase } from './src/database/db.js';
+              const db = new RepositoryDatabase();
+              const cats = db.getAllCategories();
+              console.log(cats.length);
+              db.close();
+            " 2>/dev/null || echo "0")
+            
+            echo "- **Categories:** $CAT_COUNT"
+            echo ""
+            
+            echo "## Repositories"
+            echo ""
+            node -e "
+              import { RepositoryDatabase } from './src/database/db.js';
+              const db = new RepositoryDatabase();
+              const repos = db.getAllRepositories();
+              repos.forEach(r => {
+                console.log(\`### \${r.name}\`);
+                console.log(\`- **URL:** \${r.url}\`);
+                console.log(\`- **Category:** \${r.category || 'uncategorized'}\`);
+                console.log(\`- **Processed:** \${r.processed_at}\`);
+                console.log('');
+              });
+              db.close();
+            " 2>/dev/null || echo "No repositories found"
+            
+            echo ""
+            echo "## Categories"
+            echo ""
+            node -e "
+              import { RepositoryDatabase } from './src/database/db.js';
+              const db = new RepositoryDatabase();
+              const cats = db.getAllCategories();
+              cats.forEach(c => {
+                console.log(\`### \${c.name}\`);
+                console.log(\`\${c.description}\`);
+                const repos = db.getRepositoriesByCategory(c.name);
+                console.log(\`- **Repositories:** \${repos.length}\`);
+                console.log('');
+              });
+              db.close();
+            " 2>/dev/null || echo "No categories found"
+            
+            echo ""
+            echo "## Tools"
+            echo ""
+            node src/analyze-repositories.js tools 2>/dev/null || echo "No tools found"
+            
+          } > reports/analysis-report.md
+
+      - name: Generate category reports
+        run: |
+          # Get all categories and generate individual reports
+          node -e "
+            import { RepositoryDatabase } from './src/database/db.js';
+            const db = new RepositoryDatabase();
+            const cats = db.getAllCategories();
+            cats.forEach(c => console.log(c.name));
+            db.close();
+          " 2>/dev/null | while read -r category; do
+            if [ -n \"\$category\" ]; then
+              echo \"Generating report for category: \$category\"
+              node src/analyze-repositories.js report \"\$category\" > \"reports/category-\${category}.json\" 2>/dev/null || true
+            fi
+          done
+
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-reports-${{ github.run_number }}
+          path: reports/
+          retention-days: 365
+
+      - name: Create release with reports
+        if: github.event_name == 'schedule'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: report-${{ github.run_number }}-${{ github.run_id }}
+          name: Analysis Report ${{ github.run_number }}
+          body: |
+            Automated analysis report generated on $(date -u +"%Y-%m-%d")
+            
+            This release contains:
+            - Comprehensive analysis report
+            - Category-specific reports
+            - Database snapshot
+          files: |
+            reports/*.md
+            reports/*.json
+            repositories.db
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
