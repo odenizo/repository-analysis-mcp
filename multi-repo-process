@@ -1,0 +1,730 @@
+# %% [markdown]
+# # Multi-Repository Repomix Packer
+
+# %% [markdown]
+# This notebook processes a list of GitHub repositories using the `repomix` tool, generates individual packed files, and creates a summary CSV file.
+# 
+# It can extract repository identifiers (`username/repo`) from various input sources defined in the configuration cell below.
+
+# %% [markdown]
+# ## Configuration
+# 
+# Define the source for repository identifiers and Repomix settings here.
+
+# %%
+import os
+import csv
+import json
+import subprocess
+import shutil
+from datetime import datetime
+import pandas as pd
+from pathlib import Path
+import re
+import sys
+import glob
+import tiktoken
+
+# --- Configuration Starts Here ---
+
+# Define the source for repository identifiers. This can be:
+# 1. A single string containing identifiers (separated by spaces, commas, or newlines).
+# A raw string containing repository URLs/identifiers
+REPO_INPUT_SOURCE = """
+https://github.com/upstash/context7
+https://github.com/AviOfLagos/MCP-coding-assistant
+https://github.com/nrwl/nx-console/tree/master/apps/nx-mcp
+https://github.com/sarathsp06/sourcesage
+https://github.com/movibe/memory-bank-mcp
+https://github.com/T1nker-1220/UltraContextAI
+https://github.com/chroma-core/chroma-mcp
+https://github.com/Jimmy974/codemcp_claude
+https://github.com/Jimmy974/qdrant-mcp-server
+https://github.com/Jimmy974/mcp-server-qdrant
+https://github.com/jeanibarz/knowledge-base-mcp-server
+https://github.com/Jimmy974/open-notebooklm
+"""
+
+# CSV column not needed since using raw string input
+CSV_REPO_COLUMN = None
+# Output directory for packed files and logs - using subfolder for systemic-repos
+OUTPUT_DIR = "repomix-outputs/systemic-repos/project-memory"
+
+# Path to directory containing already processed repositories
+PROCESSED_REPOS_DIR = "repomix-outputs/project-memory"
+
+# Repomix configuration
+REPOMIX_CONFIG = {
+    "style": "xml",              # Output format: xml, markdown, or plain
+    "remove_comments": False,    # Whether to remove comments from code
+    "remove_empty_lines": False, # Whether to remove empty lines
+    "show_line_numbers": True,   # Whether to include line numbers
+    "token_count_encoding": "o200k_base",  # Token counting method (for repomix internal count)
+    "include_empty_directories": True,     # Include empty directories in structure
+    "security_check": False      # Disable security check (use with caution)
+}
+
+# Tiktoken configuration
+TIKTOKEN_ENCODING = "o200k_base" # Encoding to use for tiktoken counting
+
+# --- Configuration Ends Here ---
+
+# Derived configuration
+OUTPUT_SUMMARY_FILE = f"{OUTPUT_DIR}/repository_summary.csv"
+LOG_FILE = f"{OUTPUT_DIR}/processing_log.txt"
+
+# Placeholder for the dynamically loaded list
+REPOSITORIES = [] 
+
+# %%
+
+
+# %% [markdown]
+# ## Logging Setup
+
+# %%
+def setup_logging():
+    """Setup logging to file and console"""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Clear previous log file
+    with open(LOG_FILE, 'w', encoding='utf-8') as f:
+        f.write(f"Repomix Multi-Repository Packer - Started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write("=" * 80 + "\n")
+
+def log(message):
+    """Log a message to both console and log file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message = f"[{timestamp}] {message}"
+    print(log_message)
+    # Append with utf-8 encoding
+    with open(LOG_FILE, 'a', encoding='utf-8') as f:
+        f.write(log_message + "\n")
+
+# Initialize logging
+setup_logging()
+log("Logging initialized.")
+
+# %% [markdown]
+# ## Input Processing
+# 
+# This cell reads the `REPO_INPUT_SOURCE`, consolidates the content, and extracts repository identifiers.
+
+# %%
+def extract_repositories_from_source(source, csv_column=0):
+    """
+    Reads input source(s), combines content into a single string, 
+    and extracts repository identifiers ('username/repo').
+    Returns a list of unique 'username/repo' strings.
+    """
+    raw_text = ""
+    repo_identifiers = set() # Use a set to store unique identifiers
+    files_processed = []
+
+    try:
+        if isinstance(source, str):
+            # Check if it's a file path
+            if os.path.isfile(source):
+                files_processed.append(source)
+                log(f"Reading single file: {source}")
+                if source.lower().endswith('.csv'):
+                    df = pd.read_csv(source)
+                    col = df.columns[csv_column] if isinstance(csv_column, int) and csv_column < len(df.columns) else csv_column
+                    if col in df.columns:
+                         raw_text += "\n".join(df[col].astype(str).tolist()) + "\n"
+                    else:
+                         log(f"Warning: Column '{col}' not found in {source}. Skipping file.")
+                else:
+                    with open(source, 'r', encoding='utf-8') as f:
+                        raw_text += f.read() + "\n"
+            # Check if it's a directory path
+            elif os.path.isdir(source):
+                log(f"Reading directory: {source}")
+                # Combine patterns for .txt and .csv
+                patterns = [os.path.join(source, '*.txt'), os.path.join(source, '*.csv')]
+                for pattern in patterns:
+                    for filepath in glob.glob(pattern):
+                        files_processed.append(filepath)
+                        log(f"Reading file in directory: {filepath}")
+                        if filepath.lower().endswith('.csv'):
+                            try:
+                                df = pd.read_csv(filepath)
+                                col = df.columns[csv_column] if isinstance(csv_column, int) and csv_column < len(df.columns) else csv_column
+                                if col in df.columns:
+                                     raw_text += "\n".join(df[col].astype(str).tolist()) + "\n"
+                                else:
+                                     log(f"Warning: Column '{col}' not found in {filepath}. Skipping file.")
+                            except pd.errors.EmptyDataError:
+                                log(f"Warning: CSV file is empty: {filepath}. Skipping.")
+                            except Exception as e_csv:
+                                log(f"Warning: Error reading CSV {filepath}: {e_csv}. Skipping.")
+                        else:
+                            with open(filepath, 'r', encoding='utf-8') as f:
+                                raw_text += f.read() + "\n"
+            # Check if it looks like a glob pattern
+            elif '*' in source or '?' in source or '[' in source:
+                 log(f"Reading files matching glob pattern: {source}")
+                 for filepath in glob.glob(source):
+                     if os.path.isfile(filepath): # Ensure it's a file
+                         files_processed.append(filepath)
+                         log(f"Reading glob match: {filepath}")
+                         if filepath.lower().endswith('.csv'):
+                             try:
+                                 df = pd.read_csv(filepath)
+                                 col = df.columns[csv_column] if isinstance(csv_column, int) and csv_column < len(df.columns) else csv_column
+                                 if col in df.columns:
+                                      raw_text += "\n".join(df[col].astype(str).tolist()) + "\n"
+                                 else:
+                                      log(f"Warning: Column '{col}' not found in {filepath}. Skipping file.")
+                             except pd.errors.EmptyDataError:
+                                 log(f"Warning: CSV file is empty: {filepath}. Skipping.")
+                             except Exception as e_csv:
+                                 log(f"Warning: Error reading CSV {filepath}: {e_csv}. Skipping.")
+                         else:
+                             with open(filepath, 'r', encoding='utf-8') as f:
+                                 raw_text += f.read() + "\n"
+                     else:
+                         log(f"Warning: Glob match is not a file: {filepath}. Skipping.")
+            # Otherwise, treat as raw string input
+            else:
+                log("Processing raw string input.")
+                raw_text = source
+
+        # Handle list of file paths
+        elif isinstance(source, list):
+            log(f"Reading list of files: {source}")
+            for filepath in source:
+                 if isinstance(filepath, str) and os.path.isfile(filepath):
+                     files_processed.append(filepath)
+                     log(f"Reading file from list: {filepath}")
+                     if filepath.lower().endswith('.csv'):
+                         try:
+                             df = pd.read_csv(filepath)
+                             col = df.columns[csv_column] if isinstance(csv_column, int) and csv_column < len(df.columns) else csv_column
+                             if col in df.columns:
+                                  raw_text += "\n".join(df[col].astype(str).tolist()) + "\n"
+                             else:
+                                  log(f"Warning: Column '{col}' not found in {filepath}. Skipping file.")
+                         except pd.errors.EmptyDataError:
+                             log(f"Warning: CSV file is empty: {filepath}. Skipping.")
+                         except Exception as e_csv:
+                             log(f"Warning: Error reading CSV {filepath}: {e_csv}. Skipping.")
+                     else:
+                         with open(filepath, 'r', encoding='utf-8') as f:
+                             raw_text += f.read() + "\n"
+                 else:
+                     log(f"Warning: Item in list is not a valid file path: {filepath}. Skipping.")
+
+        else:
+             log(f"Error: Unsupported input source type: {type(source)}")
+             return []
+
+        # --- Extraction from consolidated raw_text ---
+        if not raw_text:
+            log("Warning: No text content found from the input source(s).")
+            return []
+            
+        # Regex to find username/repo patterns (handles URLs and simple format)
+        # Pattern breakdown:
+        # (?:https?://github\.com/|git@github\.com:)? : Non-capturing group for optional URL/SSH prefixes
+        # ([\w.-]+/[\w.-]+) : Capturing group 1: username/repo (allows letters, numbers, _, ., -)
+        # (?:\.git)? : Non-capturing group for optional .git suffix
+        # Added word boundaries \b to avoid partial matches within other text
+        pattern = r'(?:https?://github\.com/|git@github\.com:)?([\w.-]+/[\w.-]+)(?:\.git)?(?=\s|,|$)'
+        matches = re.findall(pattern, raw_text)
+
+        for match in matches:
+             # Basic validation: check for slash and non-empty parts
+             if '/' in match and all(part and part != '.' and part != '..' for part in match.split('/')):
+                 repo_identifiers.add(match.strip())
+             else:
+                 log(f"Warning: Ignoring potentially invalid identifier extracted: '{match}'")
+
+    except FileNotFoundError as e:
+        log(f"Error: File not found during processing - {e}")
+    except pd.errors.ParserError as e:
+        log(f"Error: Failed to parse CSV file - {e}")
+    except KeyError as e:
+        # This might happen if csv_column is a string header not found
+        log(f"Error: CSV column '{csv_column}' not found - {e}")
+    except IndexError as e:
+        # This might happen if csv_column is an integer index out of bounds
+        log(f"Error: CSV column index error - {e}")
+    except Exception as e:
+        # Catch other potential errors during file reading or regex
+        log(f"Error processing input source: {type(e).__name__} - {e}")
+
+
+    final_list = sorted(list(repo_identifiers))
+    if files_processed:
+        log(f"Processed {len(files_processed)} file(s). Extracted {len(final_list)} unique repository identifiers.")
+    else:
+        log(f"Processed input string. Extracted {len(final_list)} unique repository identifiers.")
+        
+    return final_list
+
+# --- Execute Extraction ---
+log("Starting repository extraction from source...")
+# This line populates the REPOSITORIES list for the rest of the script
+REPOSITORIES = extract_repositories_from_source(REPO_INPUT_SOURCE, CSV_REPO_COLUMN)
+
+if not REPOSITORIES:
+    log("Warning: No repositories extracted. Check REPO_INPUT_SOURCE and file contents.")
+else:
+    log(f"Repositories to process ({len(REPOSITORIES)}): {REPOSITORIES}")
+
+# %% [markdown]
+# ## Helper Functions
+# 
+# (Verify Repomix, Run Repomix, Extract Tokens, Extract Top Files, Count Tokens with Tiktoken)
+
+# %%
+def get_already_processed_repos():
+    """
+    Get a list of repositories that have already been processed
+    by examining files in the processed repositories directory.
+    Returns a set of normalized repository names (username/repo).
+    """
+    processed_repos = set()
+    
+    if not os.path.exists(PROCESSED_REPOS_DIR):
+        log(f"Processed repositories directory not found at: {PROCESSED_REPOS_DIR}")
+        return processed_repos
+    
+    # Get all XML files in the directory
+    pattern = os.path.join(PROCESSED_REPOS_DIR, "*.xml")
+    for filepath in glob.glob(pattern):
+        filename = os.path.basename(filepath)
+        # Extract repository name from filename (format: username_repo.xml)
+        # First remove the extension
+        repo_name_sanitized = os.path.splitext(filename)[0]
+        # Convert underscores back to slashes for the first occurrence 
+        # This is an approximation since the exact original format might be lost
+        parts = repo_name_sanitized.split('_', 1)
+        if len(parts) == 2:
+            username, repo = parts
+            processed_repos.add(f"{username}/{repo}")
+            log(f"Found already processed repository: {username}/{repo}")
+    
+    log(f"Found {len(processed_repos)} already processed repositories")
+    return processed_repos
+
+def verify_repomix_installation():
+    """Verify that Repomix is installed"""
+    try:
+        # Use shell=True on Windows if repomix is installed via npm globally and not directly in PATH
+        # Or ensure the npm global bin directory is in your system's PATH environment variable.
+        is_windows = sys.platform == "win32"
+        result = subprocess.run(["repomix", "--version"], capture_output=True, text=True, check=True, encoding='utf-8', shell=is_windows)
+        log(f"Repomix found: {result.stdout.strip()}")
+        return True
+    except subprocess.CalledProcessError as e:
+        log(f"ERROR: Repomix version check failed (is it installed globally and in PATH?): {e.stderr}")
+        return False
+    except FileNotFoundError:
+        log("ERROR: Repomix command not found. Please install it globally ('npm install -g repomix') or ensure it's in the system PATH.")
+        return False
+    except Exception as e:
+        log(f"ERROR: Unexpected error during Repomix check: {e}")
+        return False
+
+def run_repomix(repo, output_path):
+    """Run Repomix on the specified repository"""
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    cmd = ["repomix", "--remote", repo, "--output", output_path, "--style", REPOMIX_CONFIG["style"]]
+
+    # Add optional parameters based on configuration
+    if REPOMIX_CONFIG.get("show_line_numbers", False):
+        cmd.append("--output-show-line-numbers")
+    if REPOMIX_CONFIG.get("remove_comments", False):
+        cmd.append("--remove-comments")
+    if REPOMIX_CONFIG.get("remove_empty_lines", False):
+        cmd.append("--remove-empty-lines")
+    if REPOMIX_CONFIG.get("include_empty_directories", False):
+        cmd.append("--include-empty-directories")
+    if not REPOMIX_CONFIG.get("security_check", True): # Default to True if not specified
+        cmd.append("--no-security-check")
+
+    # Add token count encoding if specified
+    if "token_count_encoding" in REPOMIX_CONFIG:
+        cmd.extend(["--token-count-encoding", REPOMIX_CONFIG["token_count_encoding"]])
+
+    log(f"Executing: {' '.join(cmd)}")
+    is_windows = sys.platform == "win32"
+
+    try:
+        # Use shell=True on Windows if needed
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8', shell=is_windows)
+        log(f"Successfully processed {repo}")
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        # Log more detailed error output from repomix
+        error_message = f"Error processing {repo}. Repomix failed with exit code {e.returncode}."
+        if e.stdout:
+            error_message += f"\nRepomix STDOUT:\n{e.stdout.strip()}"
+        if e.stderr:
+            error_message += f"\nRepomix STDERR:\n{e.stderr.strip()}"
+        log(error_message)
+        return False, e.stderr
+    except FileNotFoundError:
+        log(f"ERROR: Repomix command not found while trying to process {repo}. Ensure it's installed and in PATH.")
+        return False, "Repomix command not found"
+    except Exception as e:
+        log(f"An unexpected error occurred while running repomix for {repo}: {type(e).__name__} - {str(e)}")
+        return False, str(e)
+
+def extract_token_count(output_path):
+    """Extract token count from the Repomix output file"""
+    try:
+        with open(output_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        style = REPOMIX_CONFIG.get("style", "xml")  # Default to xml if not set
+        match = None
+        if style == "xml":
+            # Improved regex to find token count within the summary
+            summary_match = re.search(r'<file_summary>.*?</file_summary>', content, re.DOTALL | re.IGNORECASE)
+            if summary_match:
+                match = re.search(r'<total_tokens>(\d+)</total_tokens>', summary_match.group(0))
+            else:  # Fallback if file_summary tag is missing
+                match = re.search(r'Total Tokens:\s*(\d+)', content, re.IGNORECASE)
+        elif style == "markdown":
+            match = re.search(r'Total Tokens:\s*(\d+)', content, re.IGNORECASE)
+        else:  # plain
+            match = re.search(r'Total Tokens:\s*(\d+)', content, re.IGNORECASE)
+
+        if match:
+            return int(match.group(1))
+        else:
+            log(f"Warning: Failed to extract repomix token count from {output_path} (Style: {style})")
+            return None
+            
+    except FileNotFoundError:
+        # This case is expected if run_repomix failed, no need to log error again
+        return None
+    except Exception as e:
+        log(f"Error extracting repomix token count from {output_path}: {type(e).__name__} - {str(e)}")
+        return None
+
+def extract_top_files(output_path):
+    """Extract top files by token count from the Repomix output file"""
+    try:
+        with open(output_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        top_files = []
+        style = REPOMIX_CONFIG.get("style", "xml")
+        
+        if style == "xml":
+            # Try to find within file_summary first
+            summary_section = re.search(r'<file_summary>.*?</file_summary>', content, re.DOTALL | re.IGNORECASE)
+            if summary_section:
+                 top_files_section = re.search(r'<top_files>(.*?)</top_files>', summary_section.group(0), re.DOTALL | re.IGNORECASE)
+                 if top_files_section:
+                     file_entries = re.findall(r'<file>(.*?)</file>', top_files_section.group(1), re.DOTALL | re.IGNORECASE)
+                     for entry in file_entries[:10]:
+                         path_match = re.search(r'<path>(.*?)</path>', entry, re.DOTALL)
+                         tokens_match = re.search(r'<tokens>(\d+)</tokens>', entry)
+                         if path_match and tokens_match:
+                             top_files.append({"path": path_match.group(1).strip(), "tokens": int(tokens_match.group(1))})
+        elif style == "markdown":
+            top_files_section = re.search(r'## Top Files by Token Count.*?\n\|?\s*File Path\s*\|\s*Tokens\s*\|?.*?\n\|?[-:]+\|[-:]+\|?.*?\n(.*?)(?:\n## |\n<summary>|\n<!-- |\Z)', content, re.DOTALL | re.IGNORECASE)
+            if top_files_section:
+                file_entries = re.findall(r'\|?\s*(.*?)\s*\|\s*(\d+)\s*\|?', top_files_section.group(1).strip())
+                for path, tokens in file_entries[:10]:
+                    top_files.append({"path": path.strip(), "tokens": int(tokens)})
+        else: # plain
+            top_files_section = re.search(r'Top Files by Token Count:\s*\n(.*?)(?:\n\n|\n=+\nFiles|\Z)', content, re.DOTALL | re.IGNORECASE)
+            if top_files_section:
+                file_entries = re.findall(r'^\s*(.*?):\s*(\d+)\s*tokens?$', top_files_section.group(1), re.MULTILINE)
+                for path, tokens in file_entries[:10]:
+                    top_files.append({"path": path.strip(), "tokens": int(tokens)})
+
+        if not top_files:
+             if os.path.exists(output_path):
+                 log(f"Warning: Could not extract top files from {output_path}. Style: {style}. Check file content and regex patterns.")
+
+        return top_files[:10] # Ensure only top 10 are returned
+        
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log(f"Error extracting top files from {output_path}: {type(e).__name__} - {str(e)}")
+        return []
+
+def count_tokens_with_tiktoken(file_path, encoding_name="cl100k_base"):
+    """Count tokens in the file content using tiktoken with specified encoding"""
+    try:
+        # Check if file exists
+        if not os.path.exists(file_path):
+            # This is expected if repomix failed, so don't log an error here
+            return None
+
+        # Read the file content
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        # Initialize the tiktoken encoder
+        try:
+            enc = tiktoken.get_encoding(encoding_name)
+        except (ValueError, KeyError) as e:
+            log(f"Error initializing tiktoken encoder '{encoding_name}': {e}. Falling back to cl100k_base.")
+            try:
+                # Fallback to cl100k_base if the specified encoding isn't available
+                enc = tiktoken.get_encoding("cl100k_base")
+            except Exception as fallback_error:
+                log(f"Fallback encoding also failed: {fallback_error}")
+                return None
+                
+        # Count tokens
+        tokens = enc.encode(content)
+        token_count = len(tokens)
+        
+        log(f"Tiktoken token count for {os.path.basename(file_path)}: {token_count} tokens (using {encoding_name})")
+        return token_count
+        
+    except UnicodeDecodeError as e:
+        log(f"Unicode decode error while reading {file_path}: {e}")
+        # Try with error handling mode
+        try:
+            with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+            enc = tiktoken.get_encoding(encoding_name)
+            tokens = enc.encode(content)
+            token_count = len(tokens)
+            log(f"Tiktoken token count for {os.path.basename(file_path)} (with encoding errors handled): {token_count}")
+            return token_count
+        except Exception as fallback_error:
+            log(f"Failed fallback attempt for {file_path}: {fallback_error}")
+            return None
+    except Exception as e:
+        log(f"Error counting tokens with tiktoken for {file_path}: {type(e).__name__} - {str(e)}")
+        return None
+
+def verify_tiktoken_installation():
+    """Verify that tiktoken is installed and can be initialized"""
+    try:
+        import tiktoken
+        # Try to initialize a common encoding
+        enc = tiktoken.get_encoding("cl100k_base")
+        # Test with a simple string
+        test_tokens = enc.encode("Testing tiktoken functionality")
+        log(f"Tiktoken verified successfully with cl100k_base encoding")
+        return True
+    except ImportError:
+        log("ERROR: tiktoken is not installed. Please install with 'pip install tiktoken'")
+        return False
+    except Exception as e:
+        log(f"ERROR: tiktoken failed to initialize: {type(e).__name__} - {str(e)}")
+        return False
+
+# %% [markdown]
+# ## Main Processing Logic
+
+# %%
+def process_repositories(repositories_list):
+    """Process all repositories in the list and gather summary data"""
+    summary_data = []
+    total_repos = len(repositories_list)
+    
+    if total_repos == 0:
+        log("No repositories found to process.")
+        return summary_data
+
+    # Get list of already processed repositories
+    processed_repos = get_already_processed_repos()
+        
+    for idx, repo in enumerate(repositories_list, 1):
+        # Check if the repository has already been processed
+        if repo in processed_repos:
+            log(f"[{idx}/{total_repos}] Skipping repository {repo} as it has already been processed")
+            continue
+            
+        # Sanitize repo name for filename (replace slashes, etc.)
+        repo_name_sanitized = re.sub(r'[^a-zA-Z0-9_-]+', '_', repo)
+        output_filename = f"{OUTPUT_DIR}/{repo_name_sanitized}.{REPOMIX_CONFIG.get('style', 'xml')}"
+
+        log(f"[{idx}/{total_repos}] Processing repository: {repo}")
+        success, output_message = run_repomix(repo, output_filename)
+
+        token_count = None
+        tiktoken_count = None
+        top_files = []
+        status = "Failed"
+
+        # Try to extract data even if repomix reported failure, as file might still exist
+        if os.path.exists(output_filename):
+            if not success:
+                log(f"Repomix failed for {repo}, but output file exists. Attempting data extraction.")
+            
+            # Extract token count from repomix output
+            log(f"Extracting token count from repomix output for {repo}...")
+            token_count = extract_token_count(output_filename)
+            
+            # Count tokens using tiktoken
+            log(f"Counting tokens with tiktoken for {repo}...")
+            tiktoken_count = count_tokens_with_tiktoken(output_filename, TIKTOKEN_ENCODING)
+            
+            # Compare counts if both methods succeeded
+            if token_count is not None and tiktoken_count is not None:
+                diff_percent = abs(token_count - tiktoken_count) / max(token_count, tiktoken_count, 1) * 100 # Avoid division by zero
+                log(f"Token count comparison for {repo}: repomix={token_count}, tiktoken={tiktoken_count}, " +
+                    f"difference={abs(token_count - tiktoken_count)} ({diff_percent:.1f}%)")
+            
+            top_files = extract_top_files(output_filename)
+            
+            # If we successfully extracted tokens, consider it a partial success
+            if success:
+                status = "Success"
+                log(f"Completed processing {repo} - Token counts: repomix={token_count if token_count is not None else 'N/A'}, " +
+                    f"tiktoken={tiktoken_count if tiktoken_count is not None else 'N/A'}")
+            elif token_count is not None or tiktoken_count is not None:
+                status = "Partial Success (Extraction OK)"
+                log(f"Partially processed {repo} (extraction OK) - Token counts: repomix={token_count}, tiktoken={tiktoken_count}")
+            else:
+                status = "Failed (Extraction Failed)"
+                log(f"Failed to process {repo} (extraction failed). Output file: {output_filename}")
+        else:
+            # Repomix failed and no output file was created
+            status = "Failed (No Output File)"
+            log(f"Failed to process {repo}. No output file generated.")
+
+        repo_data = {
+            "index": idx,
+            "repository": repo,
+            "output_file": output_filename if os.path.exists(output_filename) else "N/A",
+            "status": status,
+            "token_count": token_count if token_count is not None else 0,  # Repomix count
+            "tiktoken_count": tiktoken_count if tiktoken_count is not None else 0,  # Tiktoken count
+            "top_files": top_files
+        }
+        summary_data.append(repo_data)
+
+    return summary_data
+
+def generate_csv_summary(summary_data):
+    """Generate CSV summary of processed repositories"""
+    if not summary_data:
+        log("No summary data to generate CSV.")
+        return
+
+    try:
+        # Ensure output directory exists
+        os.makedirs(os.path.dirname(OUTPUT_SUMMARY_FILE), exist_ok=True)
+        
+        with open(OUTPUT_SUMMARY_FILE, 'w', newline='', encoding='utf-8') as csvfile:
+            # Define base fieldnames - now including tiktoken count
+            fieldnames = ['Index', 'Repository', 'Status', 'Output File', 'Repomix Token Count', 'Tiktoken Token Count', 'Token Count Difference (%)']
+            # Dynamically add top file fields based on the maximum found (up to 10)
+            max_top_files = 0
+            for repo_data in summary_data:
+                max_top_files = max(max_top_files, len(repo_data.get('top_files', [])))
+            max_top_files = min(max_top_files, 10) # Limit to 10
+
+            for i in range(1, max_top_files + 1):
+                fieldnames.extend([f'Top File {i}', f'Token Count {i}'])
+
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames, extrasaction='ignore') # Ignore extra fields
+            writer.writeheader()
+
+            for repo_data in summary_data:
+                # Calculate token count difference percentage
+                repomix_count = repo_data.get('token_count', 0) or 0
+                tiktoken_count = repo_data.get('tiktoken_count', 0) or 0
+                diff_percent = 0
+                if max(repomix_count, tiktoken_count) > 0:
+                    diff_percent = abs(repomix_count - tiktoken_count) / max(repomix_count, tiktoken_count) * 100
+                
+                row = {
+                    'Index': repo_data.get('index', 'N/A'),
+                    'Repository': repo_data.get('repository', 'N/A'),
+                    'Status': repo_data.get('status', 'Unknown'),
+                    'Output File': repo_data.get('output_file', 'N/A'),
+                    'Repomix Token Count': repomix_count,
+                    'Tiktoken Token Count': tiktoken_count,
+                    'Token Count Difference (%)': f"{diff_percent:.1f}"
+                }
+
+                # Add top files data safely
+                top_files_list = repo_data.get('top_files', [])
+                for i, file_data in enumerate(top_files_list, 1):
+                    if i <= max_top_files:
+                        row[f'Top File {i}'] = file_data.get('path', 'N/A')
+                        row[f'Token Count {i}'] = file_data.get('tokens', 'N/A')
+
+                writer.writerow(row)
+
+        log(f"CSV summary generated successfully at {OUTPUT_SUMMARY_FILE}")
+    except IOError as e:
+        log(f"Error writing CSV summary file: {type(e).__name__} - {str(e)}")
+    except Exception as e:
+        log(f"An unexpected error occurred during CSV generation: {type(e).__name__} - {str(e)}")
+
+# %% [markdown]
+# ## Run the Packer
+
+# %%
+log("Starting Multi Repository Packer Run")
+
+# Note: REPOSITORIES list is populated in the 'Input Processing' cell above
+
+# Verify installations before proceeding
+tiktoken_available = verify_tiktoken_installation()
+repomix_available = verify_repomix_installation()
+
+if not repomix_available:
+    log("Execution halted: Repomix installation check failed.")
+elif not tiktoken_available:
+    log("Warning: tiktoken verification failed. Proceeding with only repomix token counting.")
+elif not REPOSITORIES:
+    log("Execution halted: No valid repositories were extracted from the input source.")
+else:
+    # Process repositories using the dynamically populated list
+    repository_summary_data = process_repositories(REPOSITORIES)
+    
+    # Generate CSV summary if data exists
+    if repository_summary_data:
+        generate_csv_summary(repository_summary_data)
+    else:
+        log("No summary data generated as no repositories were successfully processed (or partially processed).")
+    
+    # Final summary log
+    total_processed = len(repository_summary_data)
+    success_count = sum(1 for data in repository_summary_data if data['status'].startswith('Success') or data['status'].startswith('Partial Success'))
+    log(f"Attempted processing for {len(REPOSITORIES)} extracted repositories.")
+    log(f"Successfully processed (or partially processed) {success_count} of {len(REPOSITORIES)} repositories.")
+    if total_processed > 0:
+        log(f"See '{OUTPUT_SUMMARY_FILE}' for the summary and '{LOG_FILE}' for detailed logs.")
+    else:
+        log(f"See '{LOG_FILE}' for detailed logs.")
+
+log("Multi Repository Packer run finished.")
+
+# %% [markdown]
+# ## Display Summary (Optional)
+# 
+# You can optionally load and display the generated CSV summary here using pandas.
+
+# %%
+try:
+    if os.path.exists(OUTPUT_SUMMARY_FILE):
+        summary_df = pd.read_csv(OUTPUT_SUMMARY_FILE)
+        print(f"\n--- Summary Data ({OUTPUT_SUMMARY_FILE}) ---")
+        # Display the dataframe - adjust display options if needed
+        with pd.option_context('display.max_rows', 200, 'display.max_columns', 25, 'display.width', 120):
+             # Use display() in Jupyter/IPython for better rendering if available
+             try:
+                 # Make sure display is defined (e.g., from IPython.display import display)
+                 from IPython.display import display
+                 display(summary_df)
+             except NameError:
+                 print(summary_df)
+             except ImportError:
+                  print(summary_df)
+    else:
+        print(f"\nSummary file '{OUTPUT_SUMMARY_FILE}' not found or not generated yet.")
+except Exception as e:
+    print(f"\nError reading or displaying summary CSV: {type(e).__name__} - {e}")
+
