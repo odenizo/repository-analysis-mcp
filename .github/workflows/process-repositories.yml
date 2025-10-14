@@ -1,0 +1,114 @@
+name: Process and Analyze Repositories
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: 'Repository URL to process'
+        required: true
+        type: string
+      repository_name:
+        description: 'Repository name'
+        required: true
+        type: string
+      repository_description:
+        description: 'Repository description'
+        required: false
+        type: string
+  schedule:
+    # Run weekly on Sundays at 00:00 UTC
+    - cron: '0 0 * * 0'
+  push:
+    branches:
+      - main
+    paths:
+      - 'repositories.json'
+
+jobs:
+  process-repository:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install repomix
+        run: npm install -g repomix
+
+      - name: Process single repository
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.repository_url
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          node src/process-repository.js \
+            "${{ github.event.inputs.repository_url }}" \
+            "${{ github.event.inputs.repository_name }}" \
+            "${{ github.event.inputs.repository_description }}"
+
+      - name: Process batch repositories
+        if: github.event_name == 'push' || github.event_name == 'schedule'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -f repositories.json ]; then
+            node src/index.js batch repositories.json
+          else
+            echo "No repositories.json found, skipping batch processing"
+          fi
+
+      - name: Analyze repositories
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          node src/analyze-repositories.js
+
+      - name: Upload database
+        uses: actions/upload-artifact@v4
+        with:
+          name: repository-database
+          path: repositories.db
+          retention-days: 90
+
+      - name: Upload repomix outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: repomix-outputs
+          path: repomix-outputs/
+          retention-days: 90
+
+      - name: Generate report
+        run: |
+          echo "# Repository Analysis Report" > report.md
+          echo "" >> report.md
+          echo "Generated at: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> report.md
+          echo "" >> report.md
+          node src/index.js list >> report.md || true
+          echo "" >> report.md
+          echo "## Tools List" >> report.md
+          node src/analyze-repositories.js tools >> report.md || true
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: analysis-report
+          path: report.md
+          retention-days: 90
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (fs.existsSync('report.md')) {
+              const report = fs.readFileSync('report.md', 'utf8');
+              console.log(report);
+            }
