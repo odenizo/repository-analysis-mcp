@@ -1,0 +1,12 @@
+[
+  {
+    "name": "example-mcp-server-1",
+    "url": "https://github.com/modelcontextprotocol/servers",
+    "description": "Official MCP servers collection"
+  },
+  {
+    "name": "example-mcp-server-2",
+    "url": "https://github.com/user/another-mcp-server",
+    "description": "Another MCP server example"
+  }
+]
